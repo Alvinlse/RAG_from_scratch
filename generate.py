@@ -2,19 +2,21 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.utils import is_flash_attn_2_available
 from transformers import BitsAndBytesConfig
+from tqdm import tqdm
 
 from semantic_search import retrieve_relevant_resources, embeddings, page_and_chunk, device
 
-# Use 4-bit quantization when CUDA is available to reduce GPU memory usage
-use_quantization_config = torch.cuda.is_available()
+use_cuda = torch.cuda.is_available()
+print(f"[INFO] CUDA available: {use_cuda}")
 
+# 4-bit quantization is only supported on CUDA
 quantization_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_compute_dtype=torch.float16
-)
+) if use_cuda else None
 
-# Choose attention implementation based on hardware capabilities
-if is_flash_attn_2_available() and torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8:
+# flash_attention_2 requires CUDA with compute capability >= 8.0
+if use_cuda and is_flash_attn_2_available() and torch.cuda.get_device_capability(0)[0] >= 8:
     attn_implementation = "flash_attention_2"
 else:
     attn_implementation = "sdpa"
@@ -27,13 +29,13 @@ tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path=model_id
 
 llm_model = AutoModelForCausalLM.from_pretrained(
     pretrained_model_name_or_path=model_id,
-    torch_dtype=torch.float16,
-    quantization_config=quantization_config if use_quantization_config else None,
-    low_cpu_mem_usage=False,
+    torch_dtype=torch.float16 if use_cuda else torch.float32,
+    quantization_config=quantization_config,
+    low_cpu_mem_usage=True,
     attn_implementation=attn_implementation
 )
 
-if not use_quantization_config:
+if not use_cuda:
     llm_model.to(device)
 
 
@@ -55,7 +57,7 @@ def get_model_mem_size(model: torch.nn.Module):
 
 def prompt_formatter(query: str, context_items: list[dict]) -> str:
     """Format a query and retrieved context chunks into a prompt for the LLM."""
-    context = "\n\n".join([f"[Page {item['page_number']}] {item['sentence_chunk']}" for item in context_items])
+    context = "\n\n".join([f" {item['sentence_chunk']}" for item in context_items])
     prompt = f"""Based on the following context from a research paper, answer the user's question as clearly and thoroughly as possible.
 If the context does not contain the answer, say so honestly.
 
@@ -90,12 +92,15 @@ def ask(query: str,
 
     # 4. Generate
     with torch.inference_mode():
-        outputs = llm_model.generate(
-            **input_ids,
-            temperature=temperature,
-            do_sample=True,
-            max_new_tokens=max_new_tokens,
-        )
+        with tqdm(total=max_new_tokens, desc="Generating answer", unit="token") as pbar:
+            outputs = llm_model.generate(
+                **input_ids,
+                temperature=temperature,
+                do_sample=True,
+                max_new_tokens=max_new_tokens,
+                max_length=None,
+            )
+            pbar.update(outputs.shape[-1] - input_ids["input_ids"].shape[-1])
 
     # 5. Decode — strip the prompt from the output
     full_output = tokenizer.decode(outputs[0], skip_special_tokens=True)

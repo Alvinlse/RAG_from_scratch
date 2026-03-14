@@ -5,7 +5,7 @@ Usage:
   # Step 1 — process the PDF and create embeddings (run once):
   python text_processing.py
 
-  # Step 2 — run the interactive Q&A assistant:
+  # Step 2 — run the interactive Q & A assistant:
   python main.py
 """
 

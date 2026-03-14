@@ -10,130 +10,117 @@ to do list:
 4. save embeddings for later use.
 """
 
-import os
-import requests
-import fitz
 from tqdm.auto import tqdm
 import pandas as pd
-from spacy.lang.en import English
 from sentence_transformers import SentenceTransformer
 import torch
+from parser import chunk_info
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-pdf_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'docs', 'Learning to Optimize Tensor Programs.pdf')
-filename = pdf_path
-
-def text_formatter(text: str) -> str:
-    import re
-    # Replace newlines with spaces
-    cleaned_text = text.replace('\n', ' ').strip()
-    # Collapse multiple spaces
-    cleaned_text = re.sub(r' +', ' ', cleaned_text)
-    return cleaned_text
-
-def open_and_read_pdf(pdf_path: str) -> list[dict]:
-    doc = fitz.open(pdf_path)
-    pages_and_text = []
-    for page_number, page in tqdm(enumerate(doc)):
-        text = page.get_text()
-        text = text_formatter(text=text)
-        pages_and_text.append({"page_number" : page_number +1 ,
-                                'page_char_count' : len(text),
-                                'page_word_count' : len(text.split(' ')),
-                                 'pages_sentence_count_raw' : len(text.split('. ')),
-                                  'page_token_count' : len(text)/4,
-                                   'text' : text })
-    
-    return pages_and_text
-
-pages_and_text = open_and_read_pdf(filename)
-#print(pages_and_text[0]) 
-
-
 """
-next, we are going to embed the text into vector for model to process. 
-since embedding model take finite tokens we need to split text into smaller chunk.
-same for LLMs( context window take finite tokens).
+ Semantic chunking — method recommended by Kshirsagar (2024):
+   "Enhancing RAG Performance Through Chunking and Text Splitting Techniques"
+
+ Algorithm (per the paper):
+   1. For each sentence i, build a *sentence group*: the window of sentences
+      surrounding i (buffer_size before + sentence i + buffer_size after).
+      Joining neighbours gives each embedding more local context than a single
+      sentence would provide.
+   2. Embed every group in one batched call.
+   3. Compute the cosine distance between embeddings of consecutive groups.
+      Low distance → same topic; high distance → topic shift.
+   4. Split at positions where the distance exceeds the breakpoint_percentile
+      threshold — this adapts to each page's own distribution of distances.
 """
-# group the sentences by pages
-nlp = English()
-nlp.add_pipe('sentencizer')
+_chunk_model = SentenceTransformer(model_name_or_path='all-mpnet-base-v2', device=device)
 
-# Teach sentencizer not to split on common academic abbreviations
-# by overriding sentence-start detection for tokens following these
-ACADEMIC_ABBREVS = {
-    'al', 'fig', 'Fig', 'eq', 'Eq', 'sec', 'Sec', 'ref', 'Ref',
-    'approx', 'avg', 'max', 'min', 'vs', 'e.g', 'i.e', 'et', 'cf',
-    'vol', 'no', 'pp', 'dr', 'prof', 'dept', 'univ',
-}
+def semantic_chunk(sentences: list[str],
+                   buffer_size: int = 1,
+                   breakpoint_percentile: int = 95,
+                   min_chunk_sentences: int = 3,
+                   max_chunk_sentences: int = 20) -> list[list[str]]:
+    """Split sentences into semantically coherent chunks using sentence groups.
 
-def is_sentence_start(token):
-    """Return False for tokens that follow academic abbreviations to avoid bad splits."""
-    if token.is_sent_start and token.i > 0:
-        prev = token.doc[token.i - 1]
-        prev_text = prev.text.rstrip('.')
-        if prev_text in ACADEMIC_ABBREVS:
-            return False
-    return token.is_sent_start
+    Args:
+        sentences: list of sentence strings for one page.
+        buffer_size: number of neighbouring sentences to include on each side
+            when building a sentence group for embedding (paper recommends 1).
+        breakpoint_percentile: cosine-distance percentile above which a
+            boundary is inserted (higher → fewer, larger chunks).
+        min_chunk_sentences: never split a chunk shorter than this.
+        max_chunk_sentences: hard cap — always split after this many sentences.
+    """
+    import numpy as np
 
-import re
+    if len(sentences) <= min_chunk_sentences:
+        return [sentences]
 
-def clean_sentences(sentences: list[str]) -> list[str]:
-    """Filter out noise common in academic PDFs: headers, page numbers, short fragments."""
-    cleaned = []
-    for s in sentences:
-        s = s.strip()
-        # Skip very short fragments (likely headers, page numbers, figure labels)
-        if len(s.split()) < 4:
-            continue
-        # Skip lines that are mostly numbers or references like "[1] Author..."
-        if re.match(r'^\[?\d+\]?\.?\s', s):
-            continue
-        cleaned.append(s)
-    return cleaned
+    # Step 1 — build sentence groups centred on each sentence.
+    groups = []
+    for i in range(len(sentences)):
+        start = max(0, i - buffer_size)
+        end = min(len(sentences), i + buffer_size + 1)
+        groups.append(' '.join(sentences[start:end]))
 
-for item in pages_and_text:
-    item['sentences'] = list(nlp(item['text']).sents)
-    item['sentences'] = [str(sentence) for sentence in item['sentences']]
-    item['sentences'] = clean_sentences(item['sentences'])
-    item['pages_sentence_count_spacy'] = len(item['sentences'])
+    # Step 2 — embed all groups in one batched call.
+    group_embeddings = _chunk_model.encode(groups, convert_to_numpy=True)
+
+    # Step 3 — cosine distances between consecutive group embeddings.
+    norms = np.linalg.norm(group_embeddings, axis=1, keepdims=True)
+    normed = group_embeddings / np.where(norms == 0, 1, norms)
+    cosine_sims = (normed[:-1] * normed[1:]).sum(axis=1)   # shape: (n-1,)
+    cosine_dists = 1 - cosine_sims
+
+    # Step 4 — threshold at the given percentile of this page's distances.
+    threshold = float(np.percentile(cosine_dists, breakpoint_percentile))
+
+    chunks: list[list[str]] = []
+    current: list[str] = []
+
+    for i, sentence in enumerate(sentences):
+        current.append(sentence)
+        if i < len(sentences) - 1:
+            gap_is_large = cosine_dists[i] >= threshold
+            chunk_too_long = len(current) >= max_chunk_sentences
+            chunk_long_enough = len(current) >= min_chunk_sentences
+            if (gap_is_large and chunk_long_enough) or chunk_too_long:
+                chunks.append(current)
+                current = []
+
+    if current:
+        # Merge a tiny trailing fragment into the previous chunk.
+        if chunks and len(current) < min_chunk_sentences:
+            chunks[-1].extend(current)
+        else:
+            chunks.append(current)
+
+    return chunks
 
 
-# split list of sentences into a smaller chunk
-num_sentence_chunk_size = 10
-def split_list(input_list : list[str],
-               slice_size : int = num_sentence_chunk_size) -> list[list[str]]:
-    return [input_list[i : i + slice_size ] for i in range(0,len(input_list), slice_size)]
-
-for item in pages_and_text:
-    item['sentences_chunk'] = split_list(item['sentences'], num_sentence_chunk_size)
+for item in tqdm(chunk_info, desc="Semantic chunking"):
+    item['sentences_chunk'] = semantic_chunk(item['text'].split('. '))
 
 # splitting each chunk into its own item.
 page_and_chunk = []
-for item in pages_and_text:
+for item in chunk_info:
     for sentence_chunk in item['sentences_chunk']:
-        chunk_dict = {}
-        chunk_dict['page_number'] = item['page_number']
-        
-        # join the sentences with a space (avoid corrupting punctuation)
         joined_sentences_chunk = ' '.join(sentence_chunk)
-
-        chunk_dict['sentence_chunk'] = joined_sentences_chunk
-        chunk_dict['chunk_char_count'] = len(joined_sentences_chunk)
-        chunk_dict['chunk_word_count'] = len(joined_sentences_chunk.split())
-        chunk_dict['chunk_token_count'] = len(joined_sentences_chunk) / 4  # ~4 chars per token
-        page_and_chunk.append(chunk_dict)  # BUG FIX: was outside the inner loop
-
+        page_and_chunk.append({
+            'sentence_chunk': joined_sentences_chunk,
+            'chunk_char_count': len(joined_sentences_chunk),
+            'chunk_word_count': len(joined_sentences_chunk.split()),
+            'chunk_token_count': len(joined_sentences_chunk) / 4,  # ~4 chars per token
+        })
 
 
 """
-embedding text chunk
+embedding text chunk  (reuses the model already loaded for semantic chunking)
 """
-embedding_model = SentenceTransformer(model_name_or_path='all-mpnet-base-v2', device=device)
-
-for item in tqdm(page_and_chunk):
-    item['embedding'] = embedding_model.encode(item['sentence_chunk'])
+all_chunks = [item['sentence_chunk'] for item in page_and_chunk]
+all_embeddings = _chunk_model.encode(all_chunks, show_progress_bar=True, convert_to_numpy=True)
+for item, emb in zip(page_and_chunk, all_embeddings):
+    item['embedding'] = emb
 
 """
  for small dataset, we can store the embedding vector in csv file.
@@ -141,12 +128,4 @@ for item in tqdm(page_and_chunk):
 """
 text_chunk_and_embedding_df = pd.DataFrame(page_and_chunk)
 text_chunk_and_embedding_df_save_path = 'text_chunk_and_embedding_df.csv'
-text_chunk_and_embedding_df.to_csv(text_chunk_and_embedding_df_save_path, index= False)
-
-
-
-
-
-
-
-
+text_chunk_and_embedding_df.to_csv(text_chunk_and_embedding_df_save_path, index=False)

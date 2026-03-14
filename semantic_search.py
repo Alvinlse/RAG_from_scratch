@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 import pandas as pd
@@ -7,9 +8,13 @@ from sentence_transformers import SentenceTransformer, util
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Load embeddings from CSV
-text_chunk_and_embedding_df = pd.read_csv('text_chunk_and_embedding_df.csv')
+_csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'text_chunk_and_embedding_df.csv')
+text_chunk_and_embedding_df = pd.read_csv(_csv_path).dropna(subset=['sentence_chunk'])
 text_chunk_and_embedding_df['embedding'] = text_chunk_and_embedding_df['embedding'].apply(
-    lambda x: np.fromstring(x.strip("[]"), sep=" ").astype(np.float32)
+    # BUG FIX: np.fromstring with sep=" " doesn't handle newlines in multi-line
+    # numpy string representations (768-dim arrays wrap across lines).
+    # str.split() splits on all whitespace including newlines.
+    lambda x: np.array(x.strip("[]").split(), dtype=np.float32)
 )
 
 embeddings = torch.tensor(np.stack(text_chunk_and_embedding_df['embedding'].to_numpy()), dtype=torch.float32).to(device)
@@ -61,8 +66,8 @@ def print_top_results_and_scores(query: str,
     print("Results:")
     for score, index in zip(scores, indices):
         print(f"Score: {score:.4f}")
-        print_wrapped(page_and_chunk[index]["sentence_chunk"])
-        print(f"Page number: {page_and_chunk[index]['page_number']}")
+        idx = index.item()  # BUG FIX: convert 0-dim tensor to plain Python int
+        print_wrapped(page_and_chunk[idx]["sentence_chunk"])
         print("\n")
 
 
